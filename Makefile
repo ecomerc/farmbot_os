@@ -16,6 +16,7 @@ endif
 endif
 
 NIF=priv/build_calendar.so
+FIRMWARE_NIF=priv/firmware_nif.so
 ARDUINO_FW=priv/arduino-firmware.hex
 FARMDUINO_FW=priv/farmduino-firmware.hex
 FARMDUINO_V14_FW=priv/farmduino_v14-firmware.hex
@@ -58,7 +59,7 @@ ARDUINO_BUILD = $(ARDUINO_BUILD_COMMON) $(ARDUINO_SRC_INO)
 BLINK_BUILD = $(ARDUINO_BUILD_COMMON) $(ARDUINO_SRC_BLINK_INO)
 CLEAR_EEPROM_BUILD = $(ARDUINO_BUILD_COMMON) $(ARDUINO_SRC_CLEAR_EEPROM_INO)
 
-all: priv $(NIF) farmbot_arduino_firmware
+all: priv $(NIF) $(FIRMWARE_NIF) farmbot_arduino_firmware
 
 farmbot_arduino_firmware_build_dirs: $(ARDUINO_BUILD_DIR) $(ARDUINO_CACHE_DIR)
 
@@ -84,6 +85,9 @@ priv:
 	mkdir -p priv
 
 $(NIF): c_src/build_calendar.c
+	$(CC) $(ERL_CFLAGS) $(NIF_CFLAGS) $(ERL_LDFLAGS) $(NIF_LDFLAGS) -o $@ $<
+
+$(FIRMWARE_NIF): c_src/firmware_nif.c
 	$(CC) $(ERL_CFLAGS) $(NIF_CFLAGS) $(ERL_LDFLAGS) $(NIF_LDFLAGS) -o $@ $<
 
 $(ARDUINO_FW):

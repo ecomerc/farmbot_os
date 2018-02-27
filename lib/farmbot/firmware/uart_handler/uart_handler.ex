@@ -4,13 +4,10 @@ defmodule Farmbot.Firmware.UartHandler do
   """
 
   use GenStage
-  alias Nerves.UART
+  alias Farmbot.Firmware
   use Farmbot.Logger
   alias Farmbot.System.ConfigStorage
   import ConfigStorage, only: [update_config_value: 4, get_config_value: 3]
-  alias Farmbot.Firmware
-  alias Firmware.{UartHandler, Vec3}
-  import Vec3, only: [fmnt_float: 1]
   @behaviour Firmware.Handler
 
   def start_link do
@@ -81,336 +78,76 @@ defmodule Farmbot.Firmware.UartHandler do
     GenStage.call(handler, {:set_servo_angle, pin, number})
   end
 
-  ## Private
-
-  defmodule State do
-    @moduledoc false
-    defstruct [
-      nerves: nil,
-      current_cmd: nil,
-      tty: nil,
-      hw: nil
-    ]
-  end
-
-  def init([]) do
-    Logger.debug 3, "Uart handler init."
-    # If in dev environment,
-    #   it is expected that this be done at compile time.
-    # If in target environment,
-    #   this should be done by `Farmbot.Firmware.AutoDetector`.
-    error_msg = "Please configure uart handler!"
-    tty = Application.get_env(:farmbot, :uart_handler)[:tty] || raise error_msg
-
-    # Disable fw input logs after a reset of the
-    # Fw handler if they were enabled.
+  def init(_) do
     update_config_value(:bool, "settings", "firmware_input_log", false)
     hw = get_config_value(:string, "settings", "firmware_hardware")
+    tty = Application.get_env(:farmbot, :uart_handler)[:tty] |> to_charlist()
+    {:ok, res} = start_handler(tty)
+    :ok = poll(res)
     gen_stage_opts = [
       dispatcher: GenStage.BroadcastDispatcher,
       subscribe_to: [ConfigStorage.Dispatcher]
     ]
-    case open_tty(tty) do
-      {:ok, nerves} ->
-        {:producer_consumer, %State{nerves: nerves, tty: tty, hw: hw}, gen_stage_opts}
-      err ->
-        {:stop, err}
+    {:producer_consumer, %{res: res}, gen_stage_opts}
+  end
+
+  @doc false
+  def terminate(_, state) do
+    if state.res do
+      stop_handler(state.res)
     end
   end
 
   def handle_events(events, _, state) do
-    state = Enum.reduce(events, state, fn(event, state_acc) ->
-      handle_config(event, state_acc)
-    end)
+    # state = Enum.reduce(events, state, fn(event, state_acc) ->
+    #   handle_config(event, state_acc)
+    # end)
+    #
+    # case state do
+    #   %State{} = state ->
+    #     {:noreply, [], state}
+    #   _ -> state
+    # end
+    {:noreply, [], state}
+  end
 
-    case state do
-      %State{} = state ->
+  def handle_info({:select, res, _ref, :ready_input}, state) do
+    {time, raw_input} = :timer.tc(fn -> receive_input(res) end)
+    case raw_input do
+      {:error, reason} -> {:stop, {:input_error, reason}, state}
+      input when is_binary(input) ->
+        :ok = poll(res)
+        Logger.debug 1, "read #{byte_size(input)} bytes in #{time}µs: #{inspect input}"
         {:noreply, [], state}
-      _ -> state
+      _ -> {:noreply, [], state}
     end
   end
 
-  defp handle_config({:config, "settings", key, _val}, state)
-    when key in ["firmware_input_log", "firmware_output_log"]
-  do
-    # Restart the framing to pick up new changes.
-    UART.configure state.nerves, [framing: UART.Framing.None, active: false]
-    configure_uart(state.nerves, true)
-    state
+  def handle_call(_, _, state) do
+    {:reply, {:error, :not_implemented}, state}
   end
 
-  defp handle_config({:config, "settings", "firmware_hardware", val}, state) do
-    if val != state.hw do
-      Logger.info 3, "firmware_hardware updated from #{state.hw} to #{val}"
-      Farmbot.BotState.set_sync_status(:maintenance)
-      UART.close(state.nerves)
-      UartHandler.Update.force_update_firmware(val)
-      open_tty(state.tty, state.nerves)
-      Farmbot.BotState.reset_sync_status()
-      Logger.busy 1, "Reinitializing Firmware."
-      old = Farmbot.System.ConfigStorage.get_config_as_map()["hardware_params"]
-      pid = case old["param_version"] do
-        nil ->
-          Logger.debug 3, "Setting up fresh params."
-          spawn Farmbot.Firmware, :do_read_params_and_report_position, [%{}]
-        _   ->
-          Logger.debug 3, "Setting up old params."
-          spawn Farmbot.Firmware, :do_read_params_and_report_position, [Map.delete(old, "param_version")]
-      end
-      Process.link(pid)
-      %{state | hw: val}
-    else
-      state
+  @on_load :load_nif
+  @doc false
+  def load_nif do
+    require Elixir.Logger
+    nif_file = '#{:code.priv_dir(:farmbot)}/firmware_nif'
+    case :erlang.load_nif(nif_file, 0) do
+      :ok -> :ok
+      {:error, {:reload, _}} -> :ok
+      {:error, reason} -> Elixir.Logger.warn "Failed to load nif: #{inspect reason}"
     end
   end
 
-  defp handle_config(_, state) do
-    state
-  end
+  ## These functions get replaced by the nif.
+  @doc false
+  def start_handler(_device), do: do_exit_no_nif()
+  @doc false
+  def stop_handler(_handler), do: do_exit_no_nif()
+  @doc false
+  def poll(_handler), do: do_exit_no_nif()
+  @doc false
+  def receive_input(_handler), do: do_exit_no_nif()
 
-  defp open_tty(tty, nerves \\ nil) do
-    Logger.debug 3, "Opening uart device: #{tty}"
-    nerves = nerves || UART.start_link |> elem(1)
-    Process.link(nerves)
-    case UART.open(nerves, tty, [speed: 115_200, active: true]) do
-      :ok ->
-        :ok = configure_uart(nerves, true)
-        # Flush the buffers so we start fresh
-        :ok = UART.flush(nerves)
-        loop_until_idle(nerves)
-      err ->
-        err
-    end
-  end
-
-  defp loop_until_idle(nerves, idle_count \\ 0)
-
-  defp loop_until_idle(nerves, 2) do
-    Logger.success 3, "Got two idles. UART is up."
-    Process.sleep(1500)
-    {:ok, nerves}
-  end
-
-  defp loop_until_idle(nerves, idle_count)
-    when is_pid(nerves) and is_number(idle_count)
-  do
-    Logger.debug 3, "Waiting for firmware idle."
-    receive do
-      {:nerves_uart, _, {:error, reason}} -> {:stop, reason}
-      {:nerves_uart, _, {:partial, _}} -> loop_until_idle(nerves, idle_count)
-      {:nerves_uart, _, {_, :idle}} -> loop_until_idle(nerves, idle_count + 1)
-      {:nerves_uart, _, {_, {:debug_message, msg}}} ->
-        if String.contains?(msg, "STARTUP") do
-          Logger.success 3, "Got #{msg}. UART is up."
-          {:ok, nerves}
-        else
-          Logger.debug 3, "Got arduino debug while booting up: #{msg}"
-          loop_until_idle(nerves, idle_count)
-        end
-      {:nerves_uart, _, _msg} -> loop_until_idle(nerves, idle_count)
-    after
-      10_000 -> {:stop, "Firmware didn't send any info for 10 seconds."}
-    end
-  end
-
-  defp configure_uart(nerves, active) do
-    UART.configure(
-      nerves,
-      framing: {Farmbot.Firmware.UartHandler.Framing, separator: "\r\n"},
-      active: active,
-      rx_framing_timeout: 500
-    )
-  end
-
-  def terminate(reason, state) do
-    Logger.warn 1, "UART handler died: #{inspect reason}"
-    if state.nerves do
-      UART.close(state.nerves)
-      UART.stop(:normal)
-    end
-  end
-
-  # if there is an error, we assume something bad has happened, and we probably
-  # Are better off crashing here, and being restarted.
-  def handle_info({:nerves_uart, _, {:error, :eio}}, state) do
-    Logger.error 1, "UART device removed."
-    old_env = Application.get_env(:farmbot, :behaviour)
-    new_env = Keyword.put(old_env, :firmware_handler, Firmware.StubHandler)
-    Application.put_env(:farmbot, :behaviour, new_env)
-    {:stop, {:error, :eio}, state}
-  end
-
-  def handle_info({:nerves_uart, _, {:error, reason}}, state) do
-    {:stop, {:error, reason}, state}
-  end
-
-  # Unhandled gcodes just get ignored.
-  def handle_info({:nerves_uart, _, {:unhandled_gcode, code_str}}, state) do
-    Logger.debug 3, "Got unhandled gcode: #{code_str}"
-    {:noreply, [], state}
-  end
-
-  def handle_info({:nerves_uart, _, {_, {:report_software_version, v}}}, state) do
-    expected = Application.get_env(:farmbot, :expected_fw_versions)
-    if v in expected do
-      {:noreply, [{:report_software_version, v}], state}
-    else
-      err = "Firmware version #{v} is not in expected versions: #{inspect expected}"
-      Logger.error 1, err
-      old_env = Application.get_env(:farmbot, :behaviour)
-      new_env = Keyword.put(old_env, :firmware_handler, Firmware.StubHandler)
-      Application.put_env(:farmbot, :behaviour, new_env)
-      {:stop, :normal, state}
-    end
-  end
-
-  def handle_info({:nerves_uart, _, {:echo, _}}, %{current_cmd: nil} = state) do
-    {:noreply, [], state}
-  end
-  def handle_info({:nerves_uart, _, {:echo, {:echo, "*F43" <> _}}}, state) do
-    {:noreply, [], state}
-  end
-
-  def handle_info({:nerves_uart, _, {:echo, {:echo, code}}}, state) do
-    distance = String.jaro_distance(state.current_cmd, code)
-    if distance > 0.85 do
-      :ok
-    else
-      err = "Echo #{code} does not match #{state.current_cmd} (#{distance})"
-      Logger.error 3, err
-    end
-    {:noreply, [], %{state | current_cmd: nil}}
-  end
-
-  def handle_info({:nerves_uart, _, {_q, :done}}, state) do
-    {:noreply, [:done], %{state | current_cmd: nil}}
-  end
-
-  def handle_info({:nerves_uart, _, {_q, gcode}}, state) do
-    {:noreply, [gcode], state}
-  end
-
-  def handle_info({:nerves_uart, _, bin}, state) when is_binary(bin) do
-    Logger.warn(3, "Unparsed Gcode: #{bin}")
-    {:noreply, [], state}
-  end
-
-  defp do_write(bin, state, dispatch \\ []) do
-    # Logger.debug 3, "writing: #{bin}"
-    case UART.write(state.nerves, bin) do
-      :ok -> {:reply, :ok, dispatch, %{state | current_cmd: bin}}
-      err -> {:reply, err, [], %{state | current_cmd: nil}}
-    end
-  end
-
-  def handle_call({:move_absolute, pos, x_speed, y_speed, z_speed}, _from, state) do
-    cmd = "X#{fmnt_float(pos.x)} "
-       <> "Y#{fmnt_float(pos.y)} "
-       <> "Z#{fmnt_float(pos.z)} "
-       <> "A#{fmnt_float(x_speed)} "
-       <> "B#{fmnt_float(y_speed)} "
-       <> "C#{fmnt_float(z_speed)}"
-    wrote = "G00 #{cmd}"
-    do_write(wrote, state)
-  end
-
-  def handle_call({:calibrate, axis}, _from, state) do
-    num = case axis |> to_string() do
-      "x" -> 14
-      "y" -> 15
-      "z" -> 16
-    end
-    do_write("F#{num}", state)
-  end
-
-  def handle_call({:find_home, axis}, _from, state) do
-    cmd = case axis |> to_string() do
-      "x" -> "11"
-      "y" -> "12"
-      "z" -> "13"
-    end
-    do_write("F#{cmd}", state)
-  end
-
-  def handle_call(:home_all, _from, state) do
-    do_write("G28", state)
-  end
-
-  def handle_call({:home, axis}, _from, state) do
-    cmd = case axis |> to_string() do
-      "x" -> "X0"
-      "y" -> "Y0"
-      "z" -> "Z0"
-    end
-    do_write("G00 #{cmd}", state)
-  end
-
-  def handle_call({:zero, axis}, _from, state) do
-    axis_format = case axis |> to_string() do
-      "x" -> "X"
-      "y" -> "Y"
-      "z" -> "Z"
-    end
-    do_write("F84 #{axis_format}1", state)
-  end
-
-  def handle_call(:emergency_lock, _from, state) do
-    r = UART.write(state.nerves, "E")
-    {:reply, r, [], state}
-  end
-
-  def handle_call(:emergency_unlock, _from, state) do
-    do_write("F09", state)
-  end
-
-  def handle_call({:read_param, param}, _from, state) do
-    num = Farmbot.Firmware.Gcode.Param.parse_param(param)
-    do_write("F21 P#{num}", state)
-  end
-
-  def handle_call({:update_param, param, val}, _from, state) do
-    num = Farmbot.Firmware.Gcode.Param.parse_param(param)
-    do_write("F22 P#{num} V#{val}", state)
-  end
-
-  def handle_call(:read_all_params, _from, state) do
-    do_write("F20", state)
-  end
-
-  def handle_call({:set_pin_mode, pin, mode}, _from, state) do
-    encoded_mode = if mode == :output, do: 1, else: 0
-    do_write("F43 P#{pin} M#{encoded_mode}", state, [])
-  end
-
-  def handle_call({:read_pin, pin, mode}, _from, state) do
-    encoded_mode = extract_pin_mode(mode)
-    dispatch = [{:report_pin_mode, pin, mode}]
-    do_write("F42 P#{pin} M#{encoded_mode}", state, dispatch)
-  end
-
-  def handle_call({:write_pin, pin, mode, value}, _from, state) do
-    encoded_mode = extract_pin_mode(mode)
-    dispatch = [{:report_pin_mode, pin, mode}, {:report_pin_value, pin, value}]
-    do_write("F41 P#{pin} V#{value} M#{encoded_mode}", state, dispatch)
-  end
-
-  def handle_call(:request_software_version, _from, state) do
-    do_write("F83", state)
-  end
-
-  def handle_call({:set_servo_angle, pin, angle}, _, state) do
-    do_write("F61 P#{pin} V#{angle}", state)
-  end
-
-  def handle_call(_call, _from, state) do
-    {:reply, {:error, :bad_call}, [], state}
-  end
-
-  def handle_demand(_amnt, state) do
-    {:noreply, [], state}
-  end
-
-  @compile {:inline, [extract_pin_mode: 1]}
-  defp extract_pin_mode(:digital), do: 0
-  defp extract_pin_mode(_), do: 1
+  defp do_exit_no_nif, do: exit("nif not loaded.")
 end
